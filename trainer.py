@@ -1,9 +1,10 @@
 import argparse
 import json
 import gym
+import os
 
+os.environ['CUDA_VISIBLE_DEVICES']='2'
 import torch as th
-
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
@@ -11,7 +12,13 @@ from stable_baselines3.common.monitor import Monitor
 from pantheonrl.common.wrappers import frame_wrap, recorder_wrap
 from pantheonrl.common.agents import OnPolicyAgent, StaticPolicyAgent
 
+
+# from pantheonrl.algos.moe.policies import  MOEPolicyMult,MOEPolicy
+from pantheonrl.algos.moe.policies import MOEPolicy
+from pantheonrl.algos.moe.agent import MOEAgent
 from pantheonrl.algos.adap.adap_learn import ADAP
+from pantheonrl.algos.moe.moe_learn import MOEL
+from pantheonrl.algos.moe.moe import MOE
 from pantheonrl.algos.adap.policies import AdapPolicyMult, AdapPolicy
 from pantheonrl.algos.adap.agent import AdapAgent
 
@@ -26,10 +33,11 @@ from pantheonrl.envs.liargym.liar import LiarEnv, LiarDefaultAgent
 
 from overcookedgym.overcooked_utils import LAYOUT_LIST
 
+
 ENV_LIST = ['RPS-v0', 'BlockEnv-v0', 'BlockEnv-v1', 'LiarsDice-v0',
             'OvercookedMultiEnv-v0']
 
-ADAP_TYPES = ['ADAP', 'ADAP_MULT']
+ADAP_TYPES = ['ADAP', 'ADAP_MULT', 'MOE']
 EGO_LIST = ['PPO', 'ModularAlgorithm', 'LOAD'] + ADAP_TYPES
 PARTNER_LIST = ['PPO', 'DEFAULT', 'FIXED'] + ADAP_TYPES
 
@@ -69,12 +77,10 @@ def latent_check(args):
     if args.ego not in ADAP_TYPES or not all_adap:
         raise EnvException(
             "both agents must be ADAP or ADAP_MULT to share latent spaces")
-
     if 'context_size' not in args.ego_config:
         args.ego_config['context_size'] = 3
     if 'context_sampler' not in args.ego_config:
         args.ego_config['context_sampler'] = "l2"
-
     for conf in args.alt_config:
         if 'context_size' not in conf:
             conf['context_size'] = args.ego_config['context_size']
@@ -123,7 +129,23 @@ def generate_ego(env, args):
             model.policy.num_partners = len(args.alt)
         return model
     elif args.ego == 'PPO':
-        return PPO(policy='MlpPolicy', **kwargs)
+        # agent = OnPolicyAgent(PPO(policy='MlpPolicy', **kwargs))
+        if args.tensorboard_log is not None:
+            agentarg = {
+                'tensorboard_log': args.tensorboard_log,
+                'tb_log_name': args.tensorboard_name+'_ego_'
+            }
+        else:
+            agentarg = {}
+
+        # config['env'] = altenv
+        # config['device'] = args.device
+        # if args.seed is not None:
+        #     config['seed'] = args.seed
+        # config['verbose'] = args.verbose_partner
+        agent = OnPolicyAgent(PPO(policy='MlpPolicy', **kwargs), **agentarg)
+        env.add_ego_agent(agent)
+        return agent
     elif args.ego == 'ADAP':
         return ADAP(policy=AdapPolicy, **kwargs)
     elif args.ego == 'ADAP_MULT':
@@ -156,11 +178,43 @@ def gen_load(config, policy_type, location):
 
     return agent
 
+def gen_load2(config, policy_type, location1,location2,expert): # for PPO-MOE TEST 
+    if policy_type == 'PPO':
+        # agent = PPO.load(location1,device='cpu')
+        agent = PPO(policy='MlpPolicy', device='cpu',**config)
+        config['expert'] = expert
+        paragent = MOEL.load(location2,device='cpu',**config)
+    else:
+        raise EnvException("Not a valid FIXED/LOAD policy")
+    return agent,paragent
+
+def gen_fixed3(config, policy_type, location1, location2, args, env): # return agent can learn which is for MOE-ppo test(adapt quickly)
+    kwargs = args.ego_config
+    kwargs['env'] = env
+    # kwargs['device'] = args.device
+    if args.seed is not None:
+        kwargs['seed'] = args.seed
+    # kwargs['tensorboard_log'] = args.tensorboard_log
+    # if args.tensorboard_log is not None:
+    #     agentarg = {
+    #             'tensorboard_log': args.tensorboard_log,
+    #             'tb_log_name': args.tensorboard_name+'_ego_'
+    #         }
+    # else:
+    agentarg = {}
+    agent,pagent = gen_load2(config, policy_type, location1,location2)
+    # agent = OnPolicyAgent(PPO(policy='MlpPolicy', **kwargs), **agentarg)
+    agent = OnPolicyAgent(agent, **agentarg)
+    return agent,StaticPolicyAgent(pagent.policy,moeflag=True)
 
 def gen_fixed(config, policy_type, location):
     agent = gen_load(config, policy_type, location)
     return StaticPolicyAgent(agent.policy)
 
+def gen_fixed2(config, policy_type, location1,location2,expert):  #do not need to learn
+    # agent = gen_load(config, policy_type, location)
+    agent,pagent = gen_load2(config, policy_type, location1,location2,expert)
+    return StaticPolicyAgent(agent.policy),StaticPolicyAgent(pagent.policy)
 
 def gen_default(config, altenv):
     if isinstance(altenv, RPSEnv):
@@ -192,24 +246,33 @@ def gen_partner(type, config, altenv, ego, args):
         }
     else:
         agentarg = {}
-
+    
+    config['tensorboard_log'] = args.tensorboard_log
     config['env'] = altenv
     config['device'] = args.device
     if args.seed is not None:
         config['seed'] = args.seed
-    config['verbose'] = args.verbose_partner
-
+    # config['verbose'] = args.verbose_partner
+    config['verbose'] = 1
+    
+    shared = ego.policy if args.share_latent else None
     if type == 'PPO':
         return OnPolicyAgent(PPO(policy='MlpPolicy', **config), **agentarg)
-
     if type == 'ADAP':
         alt = ADAP(policy=AdapPolicy, **config)
     elif type == 'ADAP_MULT':
         alt = ADAP(policy=AdapPolicyMult, **config)
+    elif type == 'MOE':
+        config['coef'] = args.coef
+        config['expert'] = args.expert
+        alt = MOEL(policy=MOEPolicy, **config)
+        return MOEAgent(alt, latent_syncer=shared, **agentarg)
+        
+        # return MOEAgent(MOEL(policy='MlpPolicy', **config), **agentarg)
+        # return MOEAgent(MOE(**config), **agentarg)
     else:
         raise EnvException("Not a valid policy")
 
-    shared = ego.policy if args.share_latent else None
     return AdapAgent(alt, latent_syncer=shared, **agentarg)
 
 
@@ -217,6 +280,7 @@ def generate_partners(altenv, env, ego, args):
     partners = []
     for i in range(len(args.alt)):
         args.partner_num = i
+        args.alt_config[i]['verbose']=1
         v = gen_partner(args.alt[i],
                         args.alt_config[i],
                         altenv,
@@ -239,16 +303,19 @@ def preset(args, preset_id):
             env_name = "%s-%s" % (args.env, args.env_config['layout_name'])
 
         if args.tensorboard_log is None:
-            args.tensorboard_log = 'logs'
+            args.tensorboard_log = 'logs'+args.env_config['layout_name']
         if args.tensorboard_name is None:
-            args.tensorboard_name = '%s-%s%s-%d' % (
-                env_name, args.ego, args.alt[0], args.seed)
+            args.tensorboard_name = '%s-%s%s-%d-%d-%d' % (
+                env_name, args.ego, args.alt[0], args.seed, args.expert,args.coef)
+
+        if args.tensorboard_pname is None:
+            args.tensorboard_pname = args.tensorboard_name+'_alt_'
         if args.ego_save is None:
-            args.ego_save = 'models/%s-%s-ego-%d' % (
-                env_name, args.ego, args.seed)
+            args.ego_save = 'models/%s-%s-ego-%d-%d-%d' % (
+                env_name, args.ego, args.seed, args.expert,args.coef)
         if args.alt_save is None:
-            args.alt_save = 'models/%s-%s-alt-%d' % (
-                env_name, args.alt[0], args.seed)
+            args.alt_save = 'models/%s-%s-alt-%d-%d-%d' % (
+                env_name, args.alt[0], args.seed, args.expert,args.coef)
         # if not args.record:
         #     args.record = 'trajs/%s-%s%s-%d' % (env_name, args.ego, args.alt[0], args.seed)
     else:
@@ -337,9 +404,13 @@ if __name__ == '__main__':
                         default=500000,
                         help='Number of time steps to run (ego perspective)')
 
+    #parser.add_argument('--device', '-d',
+    #                    default='auto',
+    #                    help='Device to run pytorch on')
     parser.add_argument('--device', '-d',
-                        default='auto',
+                        default='cuda',
                         help='Device to run pytorch on')
+
     parser.add_argument('--seed', '-s',
                         default=None,
                         type=int,
@@ -384,10 +455,25 @@ if __name__ == '__main__':
 
     parser.add_argument('--tensorboard-name',
                         help='Name for ego in tensorboard')
+    
+    parser.add_argument('--tensorboard-pname',
+                        help='Name for ego in tensorboard')
 
     parser.add_argument('--verbose-partner',
                         action='store_true',
                         help='True when partners should log to output')
+
+    parser.add_argument('--expert', 
+                        type=int,
+                        # default=1,
+                        default=8,
+                        help='Number of MOE experts')
+
+    parser.add_argument('--coef', 
+                        type=int,
+                        # default=1,
+                        default=10,
+                        help='Number of coef for dppr')
 
     parser.add_argument('--preset', type=int, help='Use preset args')
 
@@ -410,8 +496,9 @@ if __name__ == '__main__':
     learn_config = {'total_timesteps': args.total_timesteps}
     if args.tensorboard_log:
         learn_config['tb_log_name'] = args.tensorboard_name
-    ego.learn(**learn_config)
-
+    # ego.learn(**learn_config)
+    partners[0].learn(**learn_config)
+    # ego.learn()
     if args.record:
         transition = env.get_transitions()
         transition.write_transition(args.record)
